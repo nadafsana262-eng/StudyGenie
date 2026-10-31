@@ -3,9 +3,11 @@ import os
 import json
 import io
 import streamlit as st
+
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, HRFlowable
@@ -15,18 +17,30 @@ from reportlab.lib.colors import HexColor
 from reportlab.lib.enums import TA_CENTER
 from xml.sax.saxutils import escape
 
+
 # ---------------- CONFIGURATION ----------------
 
-load_dotenv()
-if "GEMINI_API_KEY" in st.secrets:
-    api_key = st.secrets["GEMINI_API_KEY"]
-else:
-    api_key = os.getenv("GEMINI_API_KEY")
 st.set_page_config(
     page_title="StudyGenie",
     page_icon="🎓",
     layout="wide"
 )
+
+load_dotenv()
+
+
+def get_api_key():
+    """Read API key from Streamlit Secrets or local .env."""
+
+    try:
+        key = st.secrets.get("GEMINI_API_KEY")
+        if key:
+            return key
+    except Exception:
+        pass
+
+    return os.getenv("GEMINI_API_KEY")
+
 
 # ---------------- DESIGN ----------------
 
@@ -61,6 +75,7 @@ div.stButton > button:hover {
 </style>
 """, unsafe_allow_html=True)
 
+
 # ---------------- HEADER ----------------
 
 st.markdown(
@@ -82,6 +97,7 @@ st.info(
     "an exam-style question paper automatically."
 )
 
+
 # ---------------- FILE UPLOAD ----------------
 
 uploaded_files = st.file_uploader(
@@ -100,6 +116,7 @@ if uploaded_files:
         if file.type.startswith("image/"):
             st.image(file, caption=file.name, width=300)
 
+
 # ---------------- GENERATE QUESTIONS ----------------
 
 if st.button("✨ Generate Question Paper", use_container_width=True):
@@ -108,14 +125,23 @@ if st.button("✨ Generate Question Paper", use_container_width=True):
         st.warning("Please upload at least one PDF or photo first.")
 
     else:
-        api_key = os.getenv("GEMINI_API_KEY")
+        api_key = get_api_key()
 
         if not api_key:
-            st.error("Gemini API key not found. Check your .env file.")
+            st.error(
+                "Gemini API key not found. "
+                "Please configure GEMINI_API_KEY in your .env file "
+                "or Streamlit Secrets."
+            )
             st.stop()
 
-        if sum(file.size for file in uploaded_files) > 20 * 1024 * 1024:
-            st.error("Your uploaded files exceed 20 MB. Please upload smaller files.")
+        total_size = sum(file.size for file in uploaded_files)
+
+        if total_size > 20 * 1024 * 1024:
+            st.error(
+                "Your uploaded files exceed 20 MB. "
+                "Please upload smaller files."
+            )
             st.stop()
 
         client = genai.Client(api_key=api_key)
@@ -185,6 +211,12 @@ if st.button("✨ Generate Question Paper", use_container_width=True):
 
                 result = json.loads(response.text)
 
+                if not isinstance(result, dict):
+                    raise ValueError("The AI returned an invalid question paper.")
+
+                if not result.get("questions"):
+                    raise ValueError("No questions were generated. Try another file.")
+
                 st.session_state["paper"] = result
 
             st.success("Your question paper has been generated!")
@@ -192,6 +224,7 @@ if st.button("✨ Generate Question Paper", use_container_width=True):
         except Exception as e:
             st.error("Something went wrong while generating questions.")
             st.error(str(e))
+
 
 # ---------------- DISPLAY QUESTION PAPER ----------------
 
@@ -228,6 +261,7 @@ if "paper" in st.session_state:
         st.caption(f"Marks: {marks}")
 
     st.markdown(f"### Total Marks: {total_marks}")
+
 
     # ---------------- DOWNLOAD PDF ----------------
 
@@ -282,11 +316,16 @@ if "paper" in st.session_state:
     )
 
     story.append(Spacer(1, 12))
-    story.append(HRFlowable(width="100%", color=HexColor("#9670cf")))
+    story.append(
+        HRFlowable(width="100%", color=HexColor("#9670cf"))
+    )
     story.append(Spacer(1, 15))
 
     story.append(
-        Paragraph("<b>Instructions:</b> Answer all questions.", styles["Normal"])
+        Paragraph(
+            "<b>Instructions:</b> Answer all questions.",
+            styles["Normal"]
+        )
     )
 
     story.append(Spacer(1, 15))
@@ -317,6 +356,9 @@ if "paper" in st.session_state:
         mime="application/pdf",
         use_container_width=True
     )
+
+
+# ---------------- FOOTER ----------------
 
 st.divider()
 
