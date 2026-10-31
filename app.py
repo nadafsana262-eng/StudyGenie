@@ -1,7 +1,7 @@
-
 import os
 import json
 import io
+import time
 import streamlit as st
 
 from dotenv import load_dotenv
@@ -30,8 +30,7 @@ load_dotenv()
 
 
 def get_api_key():
-    """Read API key from Streamlit Secrets or local .env."""
-
+    """Read API key from Streamlit Secrets or local .env file."""
     try:
         key = st.secrets.get("GEMINI_API_KEY")
         if key:
@@ -42,6 +41,58 @@ def get_api_key():
     return os.getenv("GEMINI_API_KEY")
 
 
+def is_temporary_api_error(error):
+    """Identify temporary Gemini errors."""
+    code = getattr(error, "code", None)
+    message = str(error).lower()
+
+    return (
+        code in (429, 500, 502, 503, 504)
+        or any(
+            marker in message
+            for marker in (
+                "429", "500", "502", "503", "504",
+                "resource_exhausted",
+                "service unavailable",
+                "high demand",
+                "temporarily unavailable",
+                "internal server error"
+            )
+        )
+    )
+
+
+def generate_with_retries(client, content_parts):
+    """Retry temporary Gemini failures."""
+    waits = [5, 10, 20]
+
+    for attempt in range(len(waits) + 1):
+        try:
+            return client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=content_parts,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.4
+                )
+            )
+
+        except Exception as error:
+            if (
+                not is_temporary_api_error(error)
+                or attempt == len(waits)
+            ):
+                raise
+
+            wait_seconds = waits[attempt]
+
+            st.warning(
+                f"Gemini is busy. Retrying in {wait_seconds} seconds..."
+            )
+
+            time.sleep(wait_seconds)
+
+
 # ---------------- DESIGN ----------------
 
 st.markdown("""
@@ -49,17 +100,20 @@ st.markdown("""
 .stApp {
     background: linear-gradient(135deg, #f8f4ff, #eee5ff);
 }
+
 .main-title {
     text-align: center;
     color: #673ab7;
     font-size: 44px;
     font-weight: 800;
 }
+
 .subtitle {
     text-align: center;
     color: #655477;
     font-size: 17px;
 }
+
 div.stButton > button {
     background: linear-gradient(90deg, #7e57c2, #ab83e8);
     color: white;
@@ -68,6 +122,7 @@ div.stButton > button {
     padding: 12px 25px;
     font-weight: bold;
 }
+
 div.stButton > button:hover {
     color: white;
     border: 1px solid #673ab7;
@@ -108,7 +163,9 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    st.success(f"{len(uploaded_files)} file(s) uploaded successfully!")
+    st.success(
+        f"{len(uploaded_files)} file(s) uploaded successfully!"
+    )
 
     for file in uploaded_files:
         st.write(f"📄 {file.name}")
@@ -119,7 +176,10 @@ if uploaded_files:
 
 # ---------------- GENERATE QUESTIONS ----------------
 
-if st.button("✨ Generate Question Paper", use_container_width=True):
+if st.button(
+    "✨ Generate Question Paper",
+    use_container_width=True
+):
 
     if not uploaded_files:
         st.warning("Please upload at least one PDF or photo first.")
@@ -143,8 +203,6 @@ if st.button("✨ Generate Question Paper", use_container_width=True):
                 "Please upload smaller files."
             )
             st.stop()
-
-        client = genai.Client(api_key=api_key)
 
         prompt = """
         You are an expert college examination question paper generator.
@@ -183,12 +241,12 @@ if st.button("✨ Generate Question Paper", use_container_width=True):
         - If handwriting is unclear, do not guess missing information.
         """
 
-        content_parts = [prompt]
-
         try:
             with st.spinner(
                 "✨ StudyGenie is reading your notes and preparing questions..."
             ):
+
+                content_parts = [prompt]
 
                 for file in uploaded_files:
                     file_bytes = file.getvalue()
@@ -200,30 +258,57 @@ if st.button("✨ Generate Question Paper", use_container_width=True):
 
                     content_parts.append(part)
 
-                response = client.models.generate_content(
-                    model="gemini-3.8-flash",
-                    contents=content_parts,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.4
-                    )
+                client = genai.Client(api_key=api_key)
+
+                response = generate_with_retries(
+                    client,
+                    content_parts
                 )
+
+                if response is None or not response.text:
+                    raise ValueError(
+                        "Gemini returned an empty response. Please try again."
+                    )
 
                 result = json.loads(response.text)
 
                 if not isinstance(result, dict):
-                    raise ValueError("The AI returned an invalid question paper.")
+                    raise ValueError(
+                        "The AI returned an invalid question paper."
+                    )
 
-                if not result.get("questions"):
-                    raise ValueError("No questions were generated. Try another file.")
+                questions = result.get("questions")
+
+                if not isinstance(questions, list) or not questions:
+                    raise ValueError(
+                        "No questions were generated. Try another file."
+                    )
 
                 st.session_state["paper"] = result
 
             st.success("Your question paper has been generated!")
 
-        except Exception as e:
-            st.error("Something went wrong while generating questions.")
-            st.error(str(e))
+        except Exception as error:
+            message = str(error).lower()
+
+            if is_temporary_api_error(error):
+                st.error(
+                    "Gemini is still experiencing high demand. "
+                    "Please wait a little and try again. "
+                    "Your API key does not need to be changed for this error."
+                )
+
+            elif "json" in message:
+                st.error(
+                    "Gemini returned an unreadable response. "
+                    "Please try generating the paper again."
+                )
+
+            else:
+                st.error(
+                    "Something went wrong while generating questions."
+                )
+                st.caption(str(error))
 
 
 # ---------------- DISPLAY QUESTION PAPER ----------------
@@ -243,7 +328,9 @@ if "paper" in st.session_state:
     topics = paper.get("topics", [])
 
     if topics:
-        st.write("**Important topics:** " + ", ".join(topics))
+        st.write(
+            "**Important topics:** " + ", ".join(map(str, topics))
+        )
 
     st.write("**Instructions:** Answer all questions.")
 
@@ -295,40 +382,38 @@ if "paper" in st.session_state:
         spaceAfter=5
     )
 
-    story = []
+    story = [
+        Paragraph("STUDYGENIE", title_style),
+        Paragraph("IMPORTANT QUESTION PAPER", title_style),
+        Spacer(1, 10),
 
-    story.append(Paragraph("STUDYGENIE", title_style))
-    story.append(Paragraph("IMPORTANT QUESTION PAPER", title_style))
-    story.append(Spacer(1, 10))
-
-    story.append(
         Paragraph(
-            f"<b>Subject:</b> {escape(str(paper.get('subject', 'Not detected')))}",
+            f"<b>Subject:</b> "
+            f"{escape(str(paper.get('subject', 'Not detected')))}",
             styles["Normal"]
-        )
-    )
+        ),
 
-    story.append(
         Paragraph(
             f"<b>Total Marks:</b> {total_marks}",
             styles["Normal"]
-        )
-    )
+        ),
 
-    story.append(Spacer(1, 12))
-    story.append(
-        HRFlowable(width="100%", color=HexColor("#9670cf"))
-    )
-    story.append(Spacer(1, 15))
+        Spacer(1, 12),
 
-    story.append(
+        HRFlowable(
+            width="100%",
+            color=HexColor("#9670cf")
+        ),
+
+        Spacer(1, 15),
+
         Paragraph(
             "<b>Instructions:</b> Answer all questions.",
             styles["Normal"]
-        )
-    )
+        ),
 
-    story.append(Spacer(1, 15))
+        Spacer(1, 15)
+    ]
 
     for index, item in enumerate(paper.get("questions", []), 1):
 
