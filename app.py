@@ -18,7 +18,10 @@ from xml.sax.saxutils import escape
 # ---------------- CONFIGURATION ----------------
 
 load_dotenv()
-
+if "GEMINI_API_KEY" in st.secrets:
+    api_key = st.secrets["GEMINI_API_KEY"]
+else:
+    api_key = os.getenv("GEMINI_API_KEY")
 st.set_page_config(
     page_title="StudyGenie",
     page_icon="🎓",
