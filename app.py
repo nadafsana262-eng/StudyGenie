@@ -3,21 +3,19 @@ import os
 import io
 import json
 import streamlit as st
-
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import (
     SimpleDocTemplate,
     Paragraph,
     Spacer,
-    HRFlowable
+    HRFlowable,
+    PageBreak
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.colors import HexColor
-from reportlab.lib.enums import TA_CENTER
 from xml.sax.saxutils import escape
 
 
@@ -56,7 +54,7 @@ def get_api_key():
 
 
 # --------------------------------------------------
-# 3. ERROR CLASSIFICATION
+# 3. ERROR HANDLING
 # --------------------------------------------------
 
 def get_error_code(error):
@@ -77,17 +75,104 @@ def get_error_code(error):
     return None
 
 
-def is_temporary_error(error):
-    code = get_error_code(error)
-
-    return code in (500, 502, 503, 504)
-
-
 # --------------------------------------------------
-# 4. GEMINI GENERATION WITH BACKUP MODEL
+# 4. GENERATE QUESTIONS USING GEMINI
 # --------------------------------------------------
 
-def generate_questions(client, content_parts, question_count, marks_each):
+def generate_questions(
+    client,
+    content_parts,
+    question_count,
+    marks_each,
+    question_type,
+    difficulty,
+    include_answers
+):
+
+    prompt = f"""
+You are an expert college examination paper generator.
+
+Analyse the uploaded study material carefully.
+
+Generate EXACTLY {question_count} unique questions.
+
+QUESTION SETTINGS:
+
+Question type: {question_type}
+Difficulty level: {difficulty}
+Marks per question: {marks_each}
+Include answers: {include_answers}
+
+IMPORTANT INSTRUCTIONS:
+
+1. Generate exactly {question_count} questions.
+2. Every question must carry exactly {marks_each} marks.
+3. Questions must be based on the uploaded study material.
+4. Avoid duplicate questions.
+5. Match the selected difficulty level.
+6. Do not invent unrelated information.
+
+QUESTION TYPE RULES:
+
+If question type is MCQ:
+- Each question must have exactly four options.
+- Options must be labelled A, B, C and D.
+- Only one option should be correct.
+- Include the correct option in the answer field.
+
+If question type is Short Answer:
+- Generate short-answer examination questions.
+- Include a clear, relevant answer if answers are requested.
+
+If question type is Long Answer:
+- Generate detailed, descriptive examination questions.
+- Include a suitable answer if answers are requested.
+
+If question type is Mixed:
+- Include a suitable combination of MCQs, short-answer
+  questions and long-answer questions.
+- MCQs must have four options.
+
+ANSWER RULES:
+
+If include_answers is true:
+- Provide a correct answer for every question.
+- For MCQs, provide the correct option and explanation.
+- For other questions, provide a clear model answer.
+
+If include_answers is false:
+- Set the answer field to an empty string.
+
+Return ONLY valid JSON in this format:
+
+{{
+  "subject": "Detected subject name",
+  "topics": ["Topic 1", "Topic 2"],
+  "difficulty": "{difficulty}",
+  "question_type": "{question_type}",
+  "questions": [
+    {{
+      "question": "Question text",
+      "type": "MCQ",
+      "options": {{
+        "A": "Option A",
+        "B": "Option B",
+        "C": "Option C",
+        "D": "Option D"
+      }},
+      "answer": "Correct answer",
+      "explanation": "Explanation if applicable",
+      "marks": {marks_each}
+    }}
+  ]
+}}
+
+For non-MCQ questions, use an empty object for options.
+
+Return valid JSON only. Do not include Markdown.
+"""
+
+    content_parts = [prompt] + content_parts
 
     models = [
         PRIMARY_MODEL,
@@ -99,6 +184,7 @@ def generate_questions(client, content_parts, question_count, marks_each):
     for model_name in models:
 
         try:
+
             response = client.models.generate_content(
                 model=model_name,
                 contents=content_parts,
@@ -110,63 +196,77 @@ def generate_questions(client, content_parts, question_count, marks_each):
             )
 
             if not response or not response.text:
-                raise ValueError("The AI returned an empty response.")
+                raise ValueError("Empty AI response.")
 
             result = json.loads(response.text)
 
             if not isinstance(result, dict):
-                raise ValueError("Invalid response format.")
+                raise ValueError("Invalid JSON response.")
 
             questions = result.get("questions")
 
-            if not isinstance(questions, list) or not questions:
-                raise ValueError("No questions were generated.")
+            if not isinstance(questions, list):
+                raise ValueError("Questions were not returned.")
 
             if len(questions) < question_count:
                 raise ValueError(
-                    f"The AI returned {len(questions)} questions, but "
-                    f"{question_count} were requested. Please try again."
+                    f"Only {len(questions)} questions were generated. "
+                    f"{question_count} were requested."
                 )
 
-            # Keep exactly the requested number and apply the chosen marks.
-            result["questions"] = questions[:question_count]
+            questions = questions[:question_count]
 
-            for question in result["questions"]:
+            for question in questions:
+
                 question["marks"] = marks_each
+
+                if not include_answers:
+                    question["answer"] = ""
+                    question["explanation"] = ""
+
+                if not isinstance(question.get("options"), dict):
+                    question["options"] = {}
+
+                if question.get("type") == "MCQ":
+
+                    options = question["options"]
+
+                    for option in ["A", "B", "C", "D"]:
+                        if not options.get(option):
+                            raise ValueError(
+                                "An MCQ is missing one or more options."
+                            )
+
+                    if include_answers and not question.get("answer"):
+                        raise ValueError(
+                            "An MCQ is missing its correct answer."
+                        )
+
+            result["questions"] = questions
 
             return result
 
         except Exception as error:
 
-            errors.append((model_name, error))
+            errors.append(f"{model_name}: {str(error)}")
 
             code = get_error_code(error)
 
-            # Do not waste time retrying quota or authentication errors.
             if code in (400, 401, 403, 429):
                 raise
 
-            # Try backup model for temporary server errors,
-            # model availability errors, or invalid responses.
-            if model_name == PRIMARY_MODEL:
-                continue
-
-    details = "; ".join(
-        f"{name}: {str(error)[:250]}"
-        for name, error in errors
-    )
-
     raise RuntimeError(
-        "Both Gemini models failed. Details: " + details
+        "AI generation failed. " + " | ".join(errors)
     )
 
 
 # --------------------------------------------------
-# 5. DESIGN
+# 5. PURPLE UI DESIGN
 # --------------------------------------------------
 
 st.markdown("""
 <style>
+
 .stApp {
     background: linear-gradient(135deg, #f8f4ff, #eee5ff);
 }
@@ -197,6 +297,7 @@ div.stButton > button:hover {
     color: white;
     border: 1px solid #673ab7;
 }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -221,14 +322,13 @@ st.markdown(
 st.divider()
 
 st.info(
-    "Upload your PDF notes or study photos. "
-    "StudyGenie will automatically generate "
-    "an exam-style question paper."
+    "Upload your study material and generate "
+    "AI-powered questions, answers and MCQs."
 )
 
 
 # --------------------------------------------------
-# 7. FILE UPLOAD
+# 7. UPLOAD STUDY MATERIAL
 # --------------------------------------------------
 
 uploaded_files = st.file_uploader(
@@ -244,7 +344,6 @@ if uploaded_files:
     )
 
     for file in uploaded_files:
-
         st.write(f"📄 {file.name}")
 
         if file.type.startswith("image/"):
@@ -257,32 +356,66 @@ if uploaded_files:
 
 st.markdown("## ⚙️ Question Paper Settings")
 
-setting_col1, setting_col2 = st.columns(2)
+col1, col2 = st.columns(2)
 
-with setting_col1:
+with col1:
+
     question_count = st.number_input(
         "Number of questions",
         min_value=1,
         max_value=100,
         value=12,
-        step=1,
-        help="Enter how many questions you want (1 to 100)."
+        step=1
     )
 
-with setting_col2:
+with col2:
+
     marks_each = st.number_input(
         "Marks per question",
         min_value=1,
         max_value=100,
         value=5,
-        step=1,
-        help="Enter the marks for each question (1 to 100)."
+        step=1
     )
 
+st.markdown("### Question Type")
+
+question_type = st.selectbox(
+    "Choose question format",
+    [
+        "MCQ",
+        "Short Answer",
+        "Long Answer",
+        "Mixed"
+    ]
+)
+
+st.markdown("### Difficulty Level")
+
+difficulty = st.selectbox(
+    "Choose difficulty",
+    [
+        "Easy",
+        "Medium",
+        "Hard",
+        "Mixed"
+    ]
+)
+
+st.markdown("### Answer Settings")
+
+include_answers = st.checkbox(
+    "Include answers and explanations",
+    value=True
+)
+
 st.info(
-    f"Your paper will contain {int(question_count)} questions "
-    f"with {int(marks_each)} marks each. "
-    f"Total marks: {int(question_count) * int(marks_each)}."
+    f"**Questions:** {int(question_count)}  \n"
+    f"**Marks per question:** {int(marks_each)}  \n"
+    f"**Total marks:** {int(question_count) * int(marks_each)}  \n"
+    f"**Question type:** {question_type}  \n"
+    f"**Difficulty:** {difficulty}  \n"
+    f"**Answers included:** {'Yes' if include_answers else 'No'}"
 )
 
 
@@ -297,7 +430,7 @@ if st.button(
 
     if not uploaded_files:
 
-        st.warning("Please upload your notes first.")
+        st.warning("Please upload your study material first.")
 
     else:
 
@@ -307,7 +440,7 @@ if st.button(
 
             st.error(
                 "Gemini API key not found. "
-                "Please configure GEMINI_API_KEY."
+                "Configure GEMINI_API_KEY first."
             )
             st.stop()
 
@@ -317,17 +450,13 @@ if st.button(
 
         if total_size > MAX_TOTAL_SIZE:
 
-            st.error(
-                "Total upload size exceeds 20 MB. "
-                "Please upload smaller files."
-            )
+            st.error("Total upload size exceeds 20 MB.")
             st.stop()
 
         invalid_file = next(
             (
                 file for file in uploaded_files
-                if file.size == 0
-                or file.size > MAX_FILE_SIZE
+                if file.size == 0 or file.size > MAX_FILE_SIZE
             ),
             None
         )
@@ -340,48 +469,20 @@ if st.button(
             )
             st.stop()
 
-        prompt = f"""
-You are an expert college examination question paper generator.
-
-Carefully read all uploaded study materials.
-Automatically identify the subject and important topics.
-
-Generate EXACTLY {int(question_count)} unique exam-style questions
-based only on the uploaded material.
-
-Every question must carry EXACTLY {int(marks_each)} marks.
-Do not change the requested number of questions or marks.
-
-Return ONLY valid JSON in this structure:
-
-{{
-  "subject": "Detected subject name",
-  "topics": ["Topic 1", "Topic 2"],
-  "questions": [
-    {{
-      "question": "Question text",
-      "marks": {int(marks_each)}
-    }}
-  ]
-}}
-
-Requirements:
-1. Generate exactly {int(question_count)} questions.
-2. Every question must be worth exactly {int(marks_each)} marks.
-3. Avoid duplicate or nearly identical questions.
-4. Questions must be relevant to the uploaded notes.
-5. Do not invent unrelated information.
-6. Do not include answers.
-7. Return valid JSON only.
-"""
-
         try:
 
             with st.spinner(
                 "✨ StudyGenie is analysing your notes..."
             ):
 
-                content_parts = [prompt]
+                client = genai.Client(
+                    api_key=api_key,
+                    http_options=types.HttpOptions(
+                        timeout=90000
+                    )
+                )
+
+                content_parts = []
 
                 for file in uploaded_files:
 
@@ -392,27 +493,23 @@ Requirements:
                         )
                     )
 
-                client = genai.Client(
-                    api_key=api_key,
-                    http_options=types.HttpOptions(
-                        timeout=90000
-                    )
-                )
-
                 result = generate_questions(
-                    client,
-                    content_parts,
-                    int(question_count),
-                    int(marks_each)
+                    client=client,
+                    content_parts=content_parts,
+                    question_count=int(question_count),
+                    marks_each=int(marks_each),
+                    question_type=question_type,
+                    difficulty=difficulty,
+                    include_answers=include_answers
                 )
 
                 result["marks_each"] = int(marks_each)
+                result["include_answers"] = include_answers
                 result["requested_count"] = int(question_count)
+
                 st.session_state["paper"] = result
 
-            st.success(
-                "🎉 Your question paper is ready!"
-            )
+            st.success("🎉 Your question paper is ready!")
 
         except Exception as error:
 
@@ -422,36 +519,33 @@ Requirements:
 
                 st.error(
                     "Gemini API quota or rate limit reached. "
-                    "Please check your Google AI Studio usage "
-                    "and try again later."
+                    "Please try again later."
                 )
 
             elif code in (500, 502, 503, 504):
 
                 st.error(
-                    "Both AI models are temporarily unavailable. "
+                    "The AI service is temporarily unavailable. "
                     "Please try again later."
                 )
 
             elif code in (401, 403):
 
                 st.error(
-                    "API authentication or permission error. "
-                    "Check your Gemini API key and API access."
+                    "API authentication error. "
+                    "Check your Gemini API key and permissions."
                 )
 
             else:
 
-                st.error(
-                    "Unable to generate the question paper."
-                )
+                st.error("Unable to generate the question paper.")
 
             with st.expander("Technical error details"):
                 st.code(str(error))
 
 
 # --------------------------------------------------
-# 9. DISPLAY GENERATED PAPER
+# 10. DISPLAY QUESTION PAPER
 # --------------------------------------------------
 
 if "paper" in st.session_state:
@@ -460,42 +554,70 @@ if "paper" in st.session_state:
 
     st.divider()
 
-    st.markdown("## 📝 Your Generated Question Paper")
+    st.markdown("## 📝 Generated Question Paper")
 
-    st.markdown(
+    st.write(
         f"**Subject:** {paper.get('subject', 'Not detected')}"
+    )
+
+    st.write(
+        f"**Difficulty:** {paper.get('difficulty', 'Not specified')}"
     )
 
     topics = paper.get("topics", [])
 
     if topics:
-        st.write(
-            "**Important topics:** "
-            + ", ".join(map(str, topics))
-        )
+        st.write("**Topics:** " + ", ".join(map(str, topics)))
 
     st.write("**Instructions:** Answer all questions.")
 
     total_marks = 0
 
-    for index, item in enumerate(
+    for index, question in enumerate(
         paper.get("questions", []), 1
     ):
 
-        marks = int(paper.get("marks_each", item.get("marks", 5)))
+        marks = int(question.get("marks", 0))
         total_marks += marks
 
         st.markdown(
-            f"**Q{index}. {item.get('question', '')}**"
+            f"**Q{index}. {question.get('question', '')}**"
         )
 
+        if question.get("type") == "MCQ":
+
+            options = question.get("options", {})
+
+            for letter in ["A", "B", "C", "D"]:
+
+                if options.get(letter):
+                    st.write(
+                        f"**{letter}.** {options[letter]}"
+                    )
+
         st.caption(f"Marks: {marks}")
+
+        if paper.get("include_answers"):
+
+            with st.expander(f"View Answer {index}"):
+
+                st.write(
+                    "**Answer:** "
+                    + str(question.get("answer", "Not provided"))
+                )
+
+                explanation = question.get("explanation", "")
+
+                if explanation:
+                    st.write("**Explanation:** " + str(explanation))
+
+        st.divider()
 
     st.markdown(f"### Total Marks: {total_marks}")
 
 
     # --------------------------------------------------
-    # 10. PDF DOWNLOAD
+    # 11. PDF GENERATION
     # --------------------------------------------------
 
     buffer = io.BytesIO()
@@ -516,7 +638,7 @@ if "paper" in st.session_state:
         parent=styles["Title"],
         fontSize=22,
         textColor=HexColor("#673ab7"),
-        alignment=TA_CENTER,
+        alignment=1,
         spaceAfter=15
     )
 
@@ -528,16 +650,42 @@ if "paper" in st.session_state:
         spaceAfter=5
     )
 
+    option_style = ParagraphStyle(
+        "Option",
+        parent=styles["Normal"],
+        fontSize=10,
+        leading=15,
+        leftIndent=20,
+        spaceAfter=3
+    )
+
+    answer_style = ParagraphStyle(
+        "Answer",
+        parent=styles["Normal"],
+        fontSize=10,
+        leading=15,
+        leftIndent=10,
+        textColor=HexColor("#45227b"),
+        spaceAfter=8
+    )
+
     story = [
+
         Paragraph("STUDYGENIE", title_style),
-        Paragraph("IMPORTANT QUESTION PAPER", title_style),
+
+        Paragraph("QUESTION PAPER", title_style),
+
         Spacer(1, 10),
 
         Paragraph(
             "<b>Subject:</b> "
-            + escape(
-                str(paper.get("subject", "Not detected"))
-            ),
+            + escape(str(paper.get("subject", "Not detected"))),
+            styles["Normal"]
+        ),
+
+        Paragraph(
+            "<b>Difficulty:</b> "
+            + escape(str(paper.get("difficulty", ""))),
             styles["Normal"]
         ),
 
@@ -563,25 +711,70 @@ if "paper" in st.session_state:
         Spacer(1, 15)
     ]
 
-    for index, item in enumerate(
+    for index, question in enumerate(
         paper.get("questions", []), 1
     ):
 
-        question = escape(
-            str(item.get("question", ""))
+        question_text = escape(
+            str(question.get("question", ""))
         )
 
-        marks = int(paper.get("marks_each", item.get("marks", 5)))
+        marks = int(question.get("marks", 0))
 
         story.append(
             Paragraph(
-                f"<b>Q{index}.</b> {question} "
+                f"<b>Q{index}.</b> {question_text} "
                 f"<b>[{marks} Marks]</b>",
                 question_style
             )
         )
 
-        story.append(Spacer(1, 12))
+        if question.get("type") == "MCQ":
+
+            options = question.get("options", {})
+
+            for letter in ["A", "B", "C", "D"]:
+
+                option_text = escape(
+                    str(options.get(letter, ""))
+                )
+
+                if option_text:
+                    story.append(
+                        Paragraph(
+                            f"<b>{letter}.</b> {option_text}",
+                            option_style
+                        )
+                    )
+
+        story.append(Spacer(1, 8))
+
+        if paper.get("include_answers"):
+
+            answer = escape(
+                str(question.get("answer", "Not provided"))
+            )
+
+            story.append(
+                Paragraph(
+                    f"<b>Answer:</b> {answer}",
+                    answer_style
+                )
+            )
+
+            explanation = question.get("explanation", "")
+
+            if explanation:
+
+                story.append(
+                    Paragraph(
+                        "<b>Explanation:</b> "
+                        + escape(str(explanation)),
+                        answer_style
+                    )
+                )
+
+        story.append(Spacer(1, 10))
 
     doc.build(story)
 
@@ -597,7 +790,7 @@ if "paper" in st.session_state:
 
 
 # --------------------------------------------------
-# 11. FOOTER
+# 12. FOOTER
 # --------------------------------------------------
 
 st.divider()
