@@ -1,6 +1,7 @@
+
 import os
-import json
 import io
+import json
 import time
 import streamlit as st
 
@@ -10,7 +11,10 @@ from google.genai import types
 
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    HRFlowable
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.colors import HexColor
@@ -18,7 +22,9 @@ from reportlab.lib.enums import TA_CENTER
 from xml.sax.saxutils import escape
 
 
-# ---------------- CONFIGURATION ----------------
+# --------------------------------------------------
+# 1. CONFIGURATION
+# --------------------------------------------------
 
 st.set_page_config(
     page_title="StudyGenie",
@@ -28,9 +34,18 @@ st.set_page_config(
 
 load_dotenv()
 
+PRIMARY_MODEL = "gemini-3.5-flash-lite"
+BACKUP_MODEL = "gemini-3.8-flash"
+
+MAX_FILE_SIZE = 20 * 1024 * 1024
+MAX_TOTAL_SIZE = 20 * 1024 * 1024
+
+
+# --------------------------------------------------
+# 2. API KEY
+# --------------------------------------------------
 
 def get_api_key():
-    """Read API key from Streamlit Secrets or local .env file."""
     try:
         key = st.secrets.get("GEMINI_API_KEY")
         if key:
@@ -41,59 +56,103 @@ def get_api_key():
     return os.getenv("GEMINI_API_KEY")
 
 
-def is_temporary_api_error(error):
-    """Identify temporary Gemini errors."""
+# --------------------------------------------------
+# 3. ERROR CLASSIFICATION
+# --------------------------------------------------
+
+def get_error_code(error):
     code = getattr(error, "code", None)
+
+    if code is not None:
+        try:
+            return int(code)
+        except (TypeError, ValueError):
+            pass
+
     message = str(error).lower()
 
-    return (
-        code in (429, 500, 502, 503, 504)
-        or any(
-            marker in message
-            for marker in (
-                "429", "500", "502", "503", "504",
-                "resource_exhausted",
-                "service unavailable",
-                "high demand",
-                "temporarily unavailable",
-                "internal server error"
-            )
-        )
-    )
+    for number in (429, 503, 502, 504, 500):
+        if str(number) in message:
+            return number
+
+    return None
 
 
-def generate_with_retries(client, content_parts):
-    """Retry temporary Gemini failures."""
-    waits = [5, 10, 20]
+def is_temporary_error(error):
+    code = get_error_code(error)
 
-    for attempt in range(len(waits) + 1):
+    return code in (500, 502, 503, 504)
+
+
+# --------------------------------------------------
+# 4. GEMINI GENERATION WITH BACKUP MODEL
+# --------------------------------------------------
+
+def generate_questions(client, content_parts):
+
+    models = [
+        PRIMARY_MODEL,
+        BACKUP_MODEL
+    ]
+
+    errors = []
+
+    for model_name in models:
+
         try:
-            return client.models.generate_content(
-                model="gemini-3.8-flash",
+            response = client.models.generate_content(
+                model=model_name,
                 contents=content_parts,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    temperature=0.4
+                    temperature=0.3,
+                    max_output_tokens=3500
                 )
             )
 
+            if not response or not response.text:
+                raise ValueError("The AI returned an empty response.")
+
+            result = json.loads(response.text)
+
+            if not isinstance(result, dict):
+                raise ValueError("Invalid response format.")
+
+            questions = result.get("questions")
+
+            if not isinstance(questions, list) or not questions:
+                raise ValueError("No questions were generated.")
+
+            return result
+
         except Exception as error:
-            if (
-                not is_temporary_api_error(error)
-                or attempt == len(waits)
-            ):
+
+            errors.append((model_name, error))
+
+            code = get_error_code(error)
+
+            # Do not waste time retrying quota or authentication errors.
+            if code in (400, 401, 403, 429):
                 raise
 
-            wait_seconds = waits[attempt]
+            # Try backup model for temporary server errors,
+            # model availability errors, or invalid responses.
+            if model_name == PRIMARY_MODEL:
+                continue
 
-            st.warning(
-                f"Gemini is busy. Retrying in {wait_seconds} seconds..."
-            )
+    details = "; ".join(
+        f"{name}: {str(error)[:250]}"
+        for name, error in errors
+    )
 
-            time.sleep(wait_seconds)
+    raise RuntimeError(
+        "Both Gemini models failed. Details: " + details
+    )
 
 
-# ---------------- DESIGN ----------------
+# --------------------------------------------------
+# 5. DESIGN
+# --------------------------------------------------
 
 st.markdown("""
 <style>
@@ -131,7 +190,9 @@ div.stButton > button:hover {
 """, unsafe_allow_html=True)
 
 
-# ---------------- HEADER ----------------
+# --------------------------------------------------
+# 6. HEADER
+# --------------------------------------------------
 
 st.markdown(
     '<div class="main-title">🎓 StudyGenie</div>',
@@ -139,42 +200,49 @@ st.markdown(
 )
 
 st.markdown(
-    '<div class="subtitle">Learn • Prepare • Excel ✨'
-    '<br>AI Question Paper Generator</div>',
+    '<div class="subtitle">'
+    'Learn • Prepare • Excel ✨'
+    '<br>AI Question Paper Generator'
+    '</div>',
     unsafe_allow_html=True
 )
 
 st.divider()
 
 st.info(
-    "Upload your PDF notes or photos of your notes. "
-    "StudyGenie will read your material and generate "
-    "an exam-style question paper automatically."
+    "Upload your PDF notes or study photos. "
+    "StudyGenie will automatically generate "
+    "an exam-style question paper."
 )
 
 
-# ---------------- FILE UPLOAD ----------------
+# --------------------------------------------------
+# 7. FILE UPLOAD
+# --------------------------------------------------
 
 uploaded_files = st.file_uploader(
     "📚 Upload your study material",
     type=["pdf", "png", "jpg", "jpeg"],
-    accept_multiple_files=True,
-    help="You can upload PDFs and photos of handwritten or printed notes."
+    accept_multiple_files=True
 )
 
 if uploaded_files:
+
     st.success(
         f"{len(uploaded_files)} file(s) uploaded successfully!"
     )
 
     for file in uploaded_files:
+
         st.write(f"📄 {file.name}")
 
         if file.type.startswith("image/"):
-            st.image(file, caption=file.name, width=300)
+            st.image(file, width=250)
 
 
-# ---------------- GENERATE QUESTIONS ----------------
+# --------------------------------------------------
+# 8. GENERATE QUESTION PAPER
+# --------------------------------------------------
 
 if st.button(
     "✨ Generate Question Paper",
@@ -182,136 +250,158 @@ if st.button(
 ):
 
     if not uploaded_files:
-        st.warning("Please upload at least one PDF or photo first.")
+
+        st.warning("Please upload your notes first.")
 
     else:
+
         api_key = get_api_key()
 
         if not api_key:
+
             st.error(
                 "Gemini API key not found. "
-                "Please configure GEMINI_API_KEY in your .env file "
-                "or Streamlit Secrets."
+                "Please configure GEMINI_API_KEY."
             )
             st.stop()
 
-        total_size = sum(file.size for file in uploaded_files)
+        total_size = sum(
+            file.size for file in uploaded_files
+        )
 
-        if total_size > 20 * 1024 * 1024:
+        if total_size > MAX_TOTAL_SIZE:
+
             st.error(
-                "Your uploaded files exceed 20 MB. "
+                "Total upload size exceeds 20 MB. "
                 "Please upload smaller files."
             )
             st.stop()
 
+        invalid_file = next(
+            (
+                file for file in uploaded_files
+                if file.size == 0
+                or file.size > MAX_FILE_SIZE
+            ),
+            None
+        )
+
+        if invalid_file:
+
+            st.error(
+                f"{invalid_file.name} is empty "
+                "or exceeds the file size limit."
+            )
+            st.stop()
+
         prompt = """
-        You are an expert college examination question paper generator.
+You are an expert college examination question paper generator.
 
-        Read all the uploaded study materials carefully.
-        The files can contain printed text, handwritten notes,
-        diagrams, tables, formulas or textbook content.
+Carefully read all uploaded study materials.
 
-        Automatically identify the subject and important topics.
+Automatically identify the subject and important topics.
 
-        Generate exactly 12 useful, exam-style questions based
-        on the uploaded material.
+Generate exactly 12 exam-style questions based only
+on the uploaded material.
 
-        Do not ask the user to select a subject, unit, marks,
-        difficulty or question type.
+Return ONLY valid JSON in this structure:
 
-        Return ONLY valid JSON in this exact structure:
+{
+  "subject": "Detected subject name",
+  "topics": ["Topic 1", "Topic 2"],
+  "questions": [
+    {
+      "question": "Question text",
+      "marks": 5
+    }
+  ]
+}
 
-        {
-          "subject": "Detected subject name",
-          "topics": ["Topic 1", "Topic 2"],
-          "questions": [
-            {
-              "question": "Question text",
-              "marks": 5
-            }
-          ]
-        }
-
-        Requirements:
-        - Questions must be relevant to the uploaded material.
-        - Include a mixture of short and long answer questions.
-        - Assign reasonable marks (2, 5 or 10).
-        - Avoid duplicate questions.
-        - Do not invent content unrelated to the notes.
-        - If handwriting is unclear, do not guess missing information.
-        """
+Requirements:
+1. Generate exactly 12 questions.
+2. Include short and long answer questions.
+3. Use reasonable marks: 2, 5 or 10.
+4. Avoid duplicate questions.
+5. Questions must be relevant to the uploaded notes.
+6. Do not invent unrelated information.
+7. Do not include answers.
+8. Return valid JSON only.
+"""
 
         try:
+
             with st.spinner(
-                "✨ StudyGenie is reading your notes and preparing questions..."
+                "✨ StudyGenie is analysing your notes..."
             ):
 
                 content_parts = [prompt]
 
                 for file in uploaded_files:
-                    file_bytes = file.getvalue()
 
-                    part = types.Part.from_bytes(
-                        data=file_bytes,
-                        mime_type=file.type
+                    content_parts.append(
+                        types.Part.from_bytes(
+                            data=file.getvalue(),
+                            mime_type=file.type
+                        )
                     )
 
-                    content_parts.append(part)
+                client = genai.Client(
+                    api_key=api_key,
+                    http_options=types.HttpOptions(
+                        timeout=90000
+                    )
+                )
 
-                client = genai.Client(api_key=api_key)
-
-                response = generate_with_retries(
+                result = generate_questions(
                     client,
                     content_parts
                 )
 
-                if response is None or not response.text:
-                    raise ValueError(
-                        "Gemini returned an empty response. Please try again."
-                    )
-
-                result = json.loads(response.text)
-
-                if not isinstance(result, dict):
-                    raise ValueError(
-                        "The AI returned an invalid question paper."
-                    )
-
-                questions = result.get("questions")
-
-                if not isinstance(questions, list) or not questions:
-                    raise ValueError(
-                        "No questions were generated. Try another file."
-                    )
-
                 st.session_state["paper"] = result
 
-            st.success("Your question paper has been generated!")
+            st.success(
+                "🎉 Your question paper is ready!"
+            )
 
         except Exception as error:
-            message = str(error).lower()
 
-            if is_temporary_api_error(error):
+            code = get_error_code(error)
+
+            if code == 429:
+
                 st.error(
-                    "Gemini is still experiencing high demand. "
-                    "Please wait a little and try again. "
-                    "Your API key does not need to be changed for this error."
+                    "Gemini API quota or rate limit reached. "
+                    "Please check your Google AI Studio usage "
+                    "and try again later."
                 )
 
-            elif "json" in message:
+            elif code in (500, 502, 503, 504):
+
                 st.error(
-                    "Gemini returned an unreadable response. "
-                    "Please try generating the paper again."
+                    "Both AI models are temporarily unavailable. "
+                    "Please try again later."
+                )
+
+            elif code in (401, 403):
+
+                st.error(
+                    "API authentication or permission error. "
+                    "Check your Gemini API key and API access."
                 )
 
             else:
+
                 st.error(
-                    "Something went wrong while generating questions."
+                    "Unable to generate the question paper."
                 )
-                st.caption(str(error))
+
+            with st.expander("Technical error details"):
+                st.code(str(error))
 
 
-# ---------------- DISPLAY QUESTION PAPER ----------------
+# --------------------------------------------------
+# 9. DISPLAY GENERATED PAPER
+# --------------------------------------------------
 
 if "paper" in st.session_state:
 
@@ -329,14 +419,17 @@ if "paper" in st.session_state:
 
     if topics:
         st.write(
-            "**Important topics:** " + ", ".join(map(str, topics))
+            "**Important topics:** "
+            + ", ".join(map(str, topics))
         )
 
     st.write("**Instructions:** Answer all questions.")
 
     total_marks = 0
 
-    for index, item in enumerate(paper.get("questions", []), 1):
+    for index, item in enumerate(
+        paper.get("questions", []), 1
+    ):
 
         marks = int(item.get("marks", 5))
         total_marks += marks
@@ -350,7 +443,9 @@ if "paper" in st.session_state:
     st.markdown(f"### Total Marks: {total_marks}")
 
 
-    # ---------------- DOWNLOAD PDF ----------------
+    # --------------------------------------------------
+    # 10. PDF DOWNLOAD
+    # --------------------------------------------------
 
     buffer = io.BytesIO()
 
@@ -388,8 +483,10 @@ if "paper" in st.session_state:
         Spacer(1, 10),
 
         Paragraph(
-            f"<b>Subject:</b> "
-            f"{escape(str(paper.get('subject', 'Not detected')))}",
+            "<b>Subject:</b> "
+            + escape(
+                str(paper.get("subject", "Not detected"))
+            ),
             styles["Normal"]
         ),
 
@@ -415,9 +512,14 @@ if "paper" in st.session_state:
         Spacer(1, 15)
     ]
 
-    for index, item in enumerate(paper.get("questions", []), 1):
+    for index, item in enumerate(
+        paper.get("questions", []), 1
+    ):
 
-        question = escape(str(item.get("question", "")))
+        question = escape(
+            str(item.get("question", ""))
+        )
+
         marks = int(item.get("marks", 5))
 
         story.append(
@@ -443,11 +545,14 @@ if "paper" in st.session_state:
     )
 
 
-# ---------------- FOOTER ----------------
+# --------------------------------------------------
+# 11. FOOTER
+# --------------------------------------------------
 
 st.divider()
 
 st.markdown(
-    "<center>💜 Made with StudyGenie | Learn • Prepare • Excel</center>",
+    "<center>💜 Made with StudyGenie | "
+    "Learn • Prepare • Excel</center>",
     unsafe_allow_html=True
 )
