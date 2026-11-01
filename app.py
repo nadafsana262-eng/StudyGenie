@@ -2,7 +2,6 @@
 import os
 import io
 import json
-import time
 import streamlit as st
 
 from dotenv import load_dotenv
@@ -88,7 +87,7 @@ def is_temporary_error(error):
 # 4. GEMINI GENERATION WITH BACKUP MODEL
 # --------------------------------------------------
 
-def generate_questions(client, content_parts):
+def generate_questions(client, content_parts, question_count, marks_each):
 
     models = [
         PRIMARY_MODEL,
@@ -106,7 +105,7 @@ def generate_questions(client, content_parts):
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.3,
-                    max_output_tokens=3500
+                    max_output_tokens=8192
                 )
             )
 
@@ -122,6 +121,18 @@ def generate_questions(client, content_parts):
 
             if not isinstance(questions, list) or not questions:
                 raise ValueError("No questions were generated.")
+
+            if len(questions) < question_count:
+                raise ValueError(
+                    f"The AI returned {len(questions)} questions, but "
+                    f"{question_count} were requested. Please try again."
+                )
+
+            # Keep exactly the requested number and apply the chosen marks.
+            result["questions"] = questions[:question_count]
+
+            for question in result["questions"]:
+                question["marks"] = marks_each
 
             return result
 
@@ -241,7 +252,42 @@ if uploaded_files:
 
 
 # --------------------------------------------------
-# 8. GENERATE QUESTION PAPER
+# 8. QUESTION PAPER SETTINGS
+# --------------------------------------------------
+
+st.markdown("## ⚙️ Question Paper Settings")
+
+setting_col1, setting_col2 = st.columns(2)
+
+with setting_col1:
+    question_count = st.number_input(
+        "Number of questions",
+        min_value=1,
+        max_value=100,
+        value=12,
+        step=1,
+        help="Enter how many questions you want (1 to 100)."
+    )
+
+with setting_col2:
+    marks_each = st.number_input(
+        "Marks per question",
+        min_value=1,
+        max_value=100,
+        value=5,
+        step=1,
+        help="Enter the marks for each question (1 to 100)."
+    )
+
+st.info(
+    f"Your paper will contain {int(question_count)} questions "
+    f"with {int(marks_each)} marks each. "
+    f"Total marks: {int(question_count) * int(marks_each)}."
+)
+
+
+# --------------------------------------------------
+# 9. GENERATE QUESTION PAPER
 # --------------------------------------------------
 
 if st.button(
@@ -294,38 +340,39 @@ if st.button(
             )
             st.stop()
 
-        prompt = """
+        prompt = f"""
 You are an expert college examination question paper generator.
 
 Carefully read all uploaded study materials.
-
 Automatically identify the subject and important topics.
 
-Generate exactly 12 exam-style questions based only
-on the uploaded material.
+Generate EXACTLY {int(question_count)} unique exam-style questions
+based only on the uploaded material.
+
+Every question must carry EXACTLY {int(marks_each)} marks.
+Do not change the requested number of questions or marks.
 
 Return ONLY valid JSON in this structure:
 
-{
+{{
   "subject": "Detected subject name",
   "topics": ["Topic 1", "Topic 2"],
   "questions": [
-    {
+    {{
       "question": "Question text",
-      "marks": 5
-    }
+      "marks": {int(marks_each)}
+    }}
   ]
-}
+}}
 
 Requirements:
-1. Generate exactly 12 questions.
-2. Include short and long answer questions.
-3. Use reasonable marks: 2, 5 or 10.
-4. Avoid duplicate questions.
-5. Questions must be relevant to the uploaded notes.
-6. Do not invent unrelated information.
-7. Do not include answers.
-8. Return valid JSON only.
+1. Generate exactly {int(question_count)} questions.
+2. Every question must be worth exactly {int(marks_each)} marks.
+3. Avoid duplicate or nearly identical questions.
+4. Questions must be relevant to the uploaded notes.
+5. Do not invent unrelated information.
+6. Do not include answers.
+7. Return valid JSON only.
 """
 
         try:
@@ -354,9 +401,13 @@ Requirements:
 
                 result = generate_questions(
                     client,
-                    content_parts
+                    content_parts,
+                    int(question_count),
+                    int(marks_each)
                 )
 
+                result["marks_each"] = int(marks_each)
+                result["requested_count"] = int(question_count)
                 st.session_state["paper"] = result
 
             st.success(
@@ -431,7 +482,7 @@ if "paper" in st.session_state:
         paper.get("questions", []), 1
     ):
 
-        marks = int(item.get("marks", 5))
+        marks = int(paper.get("marks_each", item.get("marks", 5)))
         total_marks += marks
 
         st.markdown(
@@ -520,7 +571,7 @@ if "paper" in st.session_state:
             str(item.get("question", ""))
         )
 
-        marks = int(item.get("marks", 5))
+        marks = int(paper.get("marks_each", item.get("marks", 5)))
 
         story.append(
             Paragraph(
